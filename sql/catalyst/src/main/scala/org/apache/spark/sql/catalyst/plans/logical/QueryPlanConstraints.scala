@@ -77,6 +77,30 @@ trait ConstraintHelper {
         inferredConstraints ++= replaceConstraints(predicates - eq - EqualNullSafe(l, r), l, r)
       case _ => // No inference
     }
+
+    // Second pass: substitute (attr = literal) bindings into range/inequality predicates.
+    // When a.pt = '20260610' and b.pt >= f(a.pt) are both in the constraint set,
+    // substituting yields b.pt >= f('20260610'), which ConstantFolding then reduces to a
+    // literal comparison that can be pushed into the right-side scan as a partition filter.
+    val attrToLiteral: Map[Attribute, Literal] = predicates.collect {
+      case EqualTo(a: Attribute, l: Literal) => a -> l
+      case EqualTo(l: Literal, a: Attribute) => a -> l
+    }.toMap
+
+    if (attrToLiteral.nonEmpty) {
+      predicates.foreach {
+        case _: EqualTo => // already handled above
+        case pred if pred.references.exists(attrToLiteral.contains) =>
+          val substituted = pred.transform {
+            case a: Attribute if attrToLiteral.contains(a) => attrToLiteral(a)
+          }
+          if (substituted.deterministic) {
+            inferredConstraints += substituted
+          }
+        case _ =>
+      }
+    }
+
     inferredConstraints -- constraints
   }
 
