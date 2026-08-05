@@ -33,10 +33,21 @@ import org.apache.spark.sql.internal.SQLConf
  * OptimizeExpand rule that pre-aggregates data before the Expand. Controlled by
  * spark.sql.optimizer.optimizeExpandRatio (default -1 = disabled).
  *
- * It also measures subexpression elimination in Expand: conditional-aggregate
- * queries whose conditions all share the same expensive subexpression, which
- * ends up in every branch of the Expand. Controlled by
- * spark.sql.subexpressionElimination.enabled (default true).
+ * It also measures two optimizations that target a shared expensive
+ * subexpression landing in the branches of the Expand, using a traffic/BI
+ * "N-day active users" rollup (conditional COUNT(DISTINCT) and conditional SUM
+ * aggregates whose conditions all share the same datetime subexpression):
+ *  - rewriteCountDistinctConditional collapses N conditional COUNT(DISTINCT)
+ *    on the same base column into one distinct group, shrinking the Expand
+ *    fan-out from Nx to 1x (cuts data amplification, not the per-row
+ *    subexpression evaluation cost);
+ *  - subexpressionElimination (in Expand, via whole-stage codegen) evaluates
+ *    the shared subexpression once per input row instead of once per Expand
+ *    branch occurrence.
+ * The three cases (base, +rewrite, +rewrite+CSE) attribute the benefit of each
+ * optimization in turn. Controlled by
+ * spark.sql.optimizer.rewriteCountDistinctConditional.enabled (default true)
+ * and spark.sql.subexpressionElimination.enabled (default true).
  *
  * To run this benchmark:
  * {{{
@@ -143,8 +154,9 @@ object ExpandBenchmark extends SqlBasedBenchmark {
    * whose conditions all share the same expensive datetime subexpression
    * (parse `pt`, format it back, then `datediff` against a fixed date).
    * `RewriteDistinctAggregates` places those conditions in the branches of an
-   * Expand, so the shared subexpression is codegen'd once per branch without
-   * subexpression elimination.
+   * Expand, so without subexpression elimination the shared subexpression is
+   * codegen'd once per occurrence: 9 in the distinct branch(es) and 9 in the
+   * SUM branch, i.e. 18 evaluations per input row.
    */
   private def conditionalAggsQuery(table: String, windows: Seq[Int]): String = {
     val daysSince = "datediff(" +
@@ -161,18 +173,50 @@ object ExpandBenchmark extends SqlBasedBenchmark {
        |GROUP BY user_id""".stripMargin
   }
 
+  /**
+   * Measures a traffic/BI "N-day active users" rollup (see [[conditionalAggsQuery]])
+   * under three combinations of the two optimizations that affect the shared
+   * `daysSince` subexpression in the Expand branches:
+   *  - base: rewriteCountDistinctConditional off, subexpression elimination off
+   *    -> 10 Expand branches (one per conditional COUNT(DISTINCT) plus one for
+   *    the SUMs), daysSince evaluated 18 times per input row;
+   *  - +rewrite: rewriteCountDistinctConditional on, CSE off -> the 9
+   *    conditional COUNT(DISTINCT) collapse into one distinct group, so the
+   *    Expand has 2 branches (data amplification drops from 10x to 2x), but
+   *    daysSince is still evaluated 18 times per input row;
+   *  - +rewrite+CSE: both on -> the Expand runs the standard whole-stage
+   *    subexpression elimination, evaluating daysSince once per input row
+   *    before the branch loop.
+   */
   private def subExprEliminationBenchmark(
       title: String, N: Long, table: String): Unit = {
     val benchmark = new Benchmark(title, N, output = output)
     val sql = conditionalAggsQuery(table, Seq(1, 7, 14, 30, 60, 90, 180, 365, 730))
 
-    benchmark.addCase("CSE disabled (re-evaluate per branch)", numIters = 3) { _ =>
-      withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
+    benchmark.addCase(
+        "rewrite off, CSE off (10x amplify, 18 evals/row)",
+        numIters = 3) { _ =>
+      withSQLConf(
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false",
+          SQLConf.REWRITE_COUNT_DISTINCT_CONDITIONAL_ENABLED.key -> "false") {
         spark.sql(sql).noop()
       }
     }
-    benchmark.addCase("CSE enabled (evaluate once per row)", numIters = 3) { _ =>
-      withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true") {
+    benchmark.addCase(
+        "rewrite on, CSE off (2x amplify, 18 evals/row)",
+        numIters = 3) { _ =>
+      withSQLConf(
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false",
+          SQLConf.REWRITE_COUNT_DISTINCT_CONDITIONAL_ENABLED.key -> "true") {
+        spark.sql(sql).noop()
+      }
+    }
+    benchmark.addCase(
+        "rewrite on, CSE on (2x amplify, 1 eval/row)",
+        numIters = 3) { _ =>
+      withSQLConf(
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true",
+          SQLConf.REWRITE_COUNT_DISTINCT_CONDITIONAL_ENABLED.key -> "true") {
         spark.sql(sql).noop()
       }
     }
