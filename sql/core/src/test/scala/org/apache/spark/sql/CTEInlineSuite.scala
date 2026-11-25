@@ -1122,6 +1122,60 @@ abstract class CTEInlineSuiteBase
     }
   }
 
+  test("SPARK-61957: same-attribute CTE copies retain pushdown and pruning") {
+    val df = sql(
+      """with c as materialized (select id, id * 2 as v, id * 3 as w from range(100))
+        |select id from c where id > 90
+        |""".stripMargin)
+    val union = df.union(df)
+    val expected = (91L to 99L).flatMap(id => Seq(Row(id), Row(id)))
+    checkAnswer(union.sort("id"), expected)
+
+    // Reusing the DataFrame creates distinct definition instances with the same attributes.
+    // They must share gathered state so both copies retain the filter and pruned projection.
+    val cteRepartitions = union.queryExecution.optimizedPlan.collect {
+      case r: RepartitionOperation => r
+    }
+    assert(cteRepartitions.length == 2,
+      s"Expected both CTE copies after optimization: ${union.queryExecution.optimizedPlan}")
+    cteRepartitions.foreach { r =>
+      assert(r.output.map(_.name) == Seq("id"), s"CTE columns should be pruned: $r")
+      assert(r.collectFirst {
+        case f @ Filter(GreaterThan(_, Literal(90, _)), _) => f
+      }.isDefined, s"Predicate 'id > 90' should be pushed into the CTE definition: $r")
+    }
+  }
+
+  test("SPARK-61957: CTE copies handle different projected columns") {
+    val df = sql(
+      """with c as materialized (select id, id * 2 as v, id * 3 as w from range(10))
+        |select * from c
+        |""".stripMargin)
+
+    // Each branch needs a different column from the reused CTE. Registering one copy must not
+    // discard the column requirements gathered from the other branch.
+    val expected = (0 until 10).map(i => Row(i * 2L)) ++ (0 until 10).map(i => Row(i * 3L))
+    checkAnswer(df.select("v").union(df.select("w")), expected)
+  }
+
+  test("SPARK-61957: correlated domain reuses CTE without losing columns") {
+    withTempView("t2", "t3") {
+      spark.range(100).selectExpr("id", "id % 10 as k").createOrReplaceTempView("t2")
+      spark.range(100).selectExpr("id", "id % 10 as k", "id % 7 as d")
+        .createOrReplaceTempView("t3")
+
+      // rewriteDomainJoins reuses the outer plan for the correlated domain, so both WithCTE
+      // nodes contain the same definition. The outer reference needs id and k, while the
+      // domain needs only k; gathering the domain must not discard id.
+      val df = sql(
+        """select * from (with y as materialized (select id, k from t2) select * from y) o
+          |where o.id > (select max(t.id) - 95 from t3 t where t.k < o.k)
+          |""".stripMargin)
+      val expected = (0L until 100L).filter(id => id % 10 != 0).map(id => Row(id, id % 10))
+      checkAnswer(df, expected)
+    }
+  }
+
   test("SPARK-61957: predicate referencing a nested MATERIALIZED CTE stays in its scope") {
     withTempView("t2", "small") {
       spark.range(100).selectExpr("id", "id % 10 as k").createOrReplaceTempView("t2")

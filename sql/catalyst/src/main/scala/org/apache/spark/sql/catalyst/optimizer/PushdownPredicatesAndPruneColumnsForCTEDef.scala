@@ -69,21 +69,22 @@ object PushdownPredicatesAndPruneColumnsForCTEDef extends Rule[LogicalPlan] with
       case WithCTE(child, cteDefs) =>
         cteDefs.foreach { cteDef =>
           gatherPredicatesAndAttributes(cteDef.child, cteMap, duplicated)
-          // InlineCTE can copy a definition with the same ID but different attributes. Such
-          // copies cannot share gathered state, unlike repeated visits to the same instance.
-          cteMap.get(cteDef.id).foreach { case (seen, _, _, _) =>
-            if (!(seen eq cteDef)) duplicated += cteDef.id
+          // Distinct copies can share state only when their attributes match. Retaining the
+          // first registration also preserves its precedence across repeated traversal.
+          cteMap.get(cteDef.id) match {
+            case Some((seen, _, _, _)) =>
+              if (seen.output.map(_.exprId) != cteDef.output.map(_.exprId)) {
+                duplicated += cteDef.id
+              }
+            case None =>
+              // The precedence is the visiting order across all scopes, not the index within
+              // this WithCTE: a definition visited later is either a later sibling (a real
+              // forward reference) or lives in a nested scope, and an earlier definition
+              // cannot see either. (A definition nested in an earlier sibling sorts lower
+              // yet is also invisible, but no reference site can see both it and the
+              // current definition, so that case never reaches the guard.)
+              cteMap.put(cteDef.id, (cteDef, cteMap.size, Seq.empty, AttributeSet.empty))
           }
-          // The precedence is the visiting order across all scopes, not the index within
-          // this WithCTE: a definition visited later is either a later sibling (a real
-          // forward reference) or lives in a nested scope, and an earlier definition
-          // cannot see either. (A definition nested in an earlier sibling sorts lower
-          // yet is also invisible, but no reference site can see both it and the
-          // current definition, so that case never reaches the guard.)
-          // Keep the original precedence when repeated subquery traversal revisits a definition:
-          // replacing an existing id does not increase cteMap.size.
-          val precedence = cteMap.get(cteDef.id).map(_._2).getOrElse(cteMap.size)
-          cteMap.put(cteDef.id, (cteDef, precedence, Seq.empty, AttributeSet.empty))
         }
         gatherPredicatesAndAttributes(child, cteMap, duplicated)
 
@@ -112,7 +113,13 @@ object PushdownPredicatesAndPruneColumnsForCTEDef extends Rule[LogicalPlan] with
           if (filteredPredicates.isEmpty) {
             Seq(Literal.TrueLiteral)
           } else {
-            preds :+ filteredPredicates.reduce(And)
+            val newPred = filteredPredicates.reduce(And)
+            // Repeated subquery traversal can gather the same reference more than once.
+            if (preds.exists(_.semanticEquals(newPred))) {
+              preds
+            } else {
+              preds :+ newPred
+            }
           }
         }
         val newAttributes = attrs ++
